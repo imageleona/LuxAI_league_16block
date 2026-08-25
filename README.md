@@ -58,23 +58,10 @@ python -m pytest lux_ai/league/tests evaluation/tests -q
 Replace `<REPOSITORY_URL>` with this repository's Git URL:
 
 ```bash
-git lfs install
-git clone <REPOSITORY_URL> LuxAI_league_16block
-cd LuxAI_league_16block
-git lfs pull
+git clone https://github.com/imageleona/LuxAI_league_16block
 ```
 
-The last command downloads the model checkpoints. Confirm that the starting
-16-block weights exist:
 
-```bash
-git lfs ls-files
-```
-
-The list should include
-`league_agents/haruto_16block/lux_ai/rl_agent/40000_weights.pt` and the four
-opponents under `internal_testing/` referenced by
-`conf/league_haruto_16block.yaml`.
 
 ADD THESE FOLDERS FROM GOOGLE DRIVE IN THE MAIN FOLDER:
 https://drive.google.com/drive/folders/14anheutHIDDFXqNTtgl8poq0MC3C_AKA?usp=sharing
@@ -127,17 +114,7 @@ replace `\` with the PowerShell continuation character (a backtick).
 
 ### CLI options
 
-The command uses [Hydra](https://hydra.cc/), so there are two kinds of CLI
-arguments:
 
-- `--config-name league_haruto_16block` selects a YAML file from `conf/`
-  without the `.yaml` suffix.
-- `key=value` overrides a top-level config value.
-- `league.key=value` overrides a value inside the `league` section.
-- `--cfg job --resolve` prints the resolved configuration and exits without
-  training.
-- `--multirun` launches a Hydra parameter sweep; avoid it until one normal run
-  has completed successfully.
 
 Common overrides:
 
@@ -152,26 +129,3 @@ Common overrides:
 | `league.priority=uniform` | Replace PFSP weighting with uniform opponent sampling. |
 | `checkpoint_freq=30` | Save a regular checkpoint every 30 minutes. |
 
-Preview an override before committing GPU time:
-
-```bash
-python run_monobeast.py --config-name league_haruto_16block \
-  total_steps=1000000 disable_wandb=true --cfg job --resolve
-```
-
-### Resume an interrupted run
-
-Use a full checkpoint such as `<step>.pt`, not a weights-only
-`<step>_weights.pt` file:
-
-```bash
-python run_monobeast.py --config-name league_haruto_16block \
-  load_dir=outputs/<MM-DD>/<HH-MM-SS> \
-  checkpoint_file=<step>.pt weights_only=false total_steps=1000000
-```
-
-This restores the model, optimizer, learning-rate scheduler, step counter, and
-`league/state.json`. When `weights_only=true`, training starts a new run from
-the selected policy weights instead.
-
-The original Toad Brigade code is MIT licensed; see [`LICENCE.txt`](LICENCE.txt).
