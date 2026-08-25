@@ -38,6 +38,8 @@ reward_space_kwargs: {}
 total_steps: 999360
 num_actors: 2
 n_actor_envs: 16
+# One optimizer update consumes 16 sequential turns from each of 4 trajectories,
+# so the learner step counter advances by 16 x 4 = 64 transitions.
 unroll_length: 16
 batch_size: 4
 discounting: 0.999
@@ -72,13 +74,16 @@ min_lr_mod: 0.01
 ## LOSS params
 entropy_cost: 2.0e-04
 baseline_cost: 1.
-teacher_kl_cost: 0.0
+# The frozen 11-24 teacher supplies a moderate policy-distillation signal.
+# This value was measured in the matching distillation preset: RL remains the
+# dominant gradient while the teacher has a meaningful influence.
+teacher_kl_cost: 0.1
 teacher_baseline_cost: 0.0
 lmb: 0.8
 reduction: sum
 
 # Frozen teacher for the KL loss (orthogonal to the league - do not remove)
-use_teacher: False
+use_teacher: True
 teacher_load_dir: C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
 teacher_checkpoint_file: 062179520_weights.pt
 
@@ -125,11 +130,14 @@ league:
   anchor_eval_at_start: True
   # Gate the pool on beating the checkpoint this run STARTED from, not 11-24.
   # The agent wins 3.5%% of games vs 11-24, so a 0.7 bar there is unreachable;
-  # against its own starting policy it begins near 0.5 and 0.7 means real progress.
-  winrate_admit_threshold: 0.7
+  # against its own starting policy it begins near 0.5 and 0.65 means real progress.
+  winrate_admit_threshold: 0.65
   winrate_admit_reference: haruto_16block
   winrate_admit_window: 50
+  # 500 x 64 = 32,000 transitions between gated admissions.
   winrate_admit_cooldown_updates: 500
+  # The 0.65 threshold admits a snapshot; it must not stop training.
+  exploiter_target_winrate: 0.0
   mirror_frac: 0.5
   snapshot_interval_updates: 500
   priority: pfsp        # pfsp | variance | uniform

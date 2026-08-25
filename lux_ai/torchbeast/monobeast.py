@@ -127,6 +127,35 @@ def compute_teacher_kl_loss(
         teacher_policy_logits: torch.Tensor,
         actions_taken_mask: torch.Tensor
 ) -> torch.Tensor:
+    # Invalid board locations have every action logit set to -inf, while valid
+    # locations still contain -inf for individual illegal actions. Both cases
+    # make the stock KL implementation encounter either softmax(all -inf) or its
+    # internal 0 * inf form. Masking the result afterwards cannot remove a NaN.
+    # Restrict both distributions to actions that are finite for both policies,
+    # replacing excluded logits with a large finite value before either softmax.
+    expanded_mask = actions_taken_mask.bool().unsqueeze(-1)
+    valid_actions = (
+        expanded_mask
+        & torch.isfinite(learner_policy_logits)
+        & torch.isfinite(teacher_policy_logits)
+    )
+    valid_rows = valid_actions.any(dim=-1, keepdim=True)
+    learner_floor = torch.full_like(
+        learner_policy_logits, torch.finfo(learner_policy_logits.dtype).min
+    )
+    teacher_floor = torch.full_like(
+        teacher_policy_logits, torch.finfo(teacher_policy_logits.dtype).min
+    )
+    learner_policy_logits = torch.where(valid_actions, learner_policy_logits, learner_floor)
+    teacher_policy_logits = torch.where(valid_actions, teacher_policy_logits, teacher_floor)
+    # Rows with no shared valid action are excluded below. Give softmax a benign
+    # finite row here so their intermediate value is also well-defined.
+    learner_policy_logits = torch.where(
+        valid_rows, learner_policy_logits, torch.zeros_like(learner_policy_logits)
+    )
+    teacher_policy_logits = torch.where(
+        valid_rows, teacher_policy_logits, torch.zeros_like(teacher_policy_logits)
+    )
     learner_policy_log_probs = F.log_softmax(learner_policy_logits, dim=-1)
     teacher_policy = F.softmax(teacher_policy_logits, dim=-1)
     kl_div = F.kl_div(
@@ -136,7 +165,8 @@ def compute_teacher_kl_loss(
         log_target=False
     ).sum(dim=-1)
     assert actions_taken_mask.shape == kl_div.shape
-    kl_div_masked = kl_div * actions_taken_mask.float()
+    effective_mask = actions_taken_mask.bool() & valid_rows.squeeze(-1)
+    kl_div_masked = torch.where(effective_mask, kl_div, torch.zeros_like(kl_div))
     # Sum over y, x, and action_planes dimensions to combine kl divergences from different actions
     return kl_div_masked.sum(dim=-1).sum(dim=-1).squeeze(dim=-2)
 
