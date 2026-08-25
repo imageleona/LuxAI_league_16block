@@ -1,0 +1,150 @@
+# ARM 1: win-rate-gated admission ON (the only difference from
+# exp_baseline). Old reward, so the reward is not a variable here.
+defaults:
+- override hydra/job_logging: colorlog
+- override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: ./outputs/${now:%m-%d}/${now:%H-%M-%S}
+
+# ============================================================================
+# PFSP league run: fine-tunes the released Toad Brigade model while sampling
+# opponents from a pool of frozen checkpoints, prioritizing opponents the
+# current agent is not reliably beating.
+# Comparison presets: league_sp.yaml (pure self-play baseline),
+# league_fsp.yaml (uniform pool sampling). Identical except the league block.
+# ============================================================================
+
+name: exp_winrate_admit
+## WANDB params
+project: Lux_AI_2021_league
+entity: null
+group: overnight_2026_08_24
+
+## ENV params
+act_space: BasicActionSpace
+obs_space: FixedShapeContinuousObsV2
+obs_space_kwargs: {}
+reward_space: GameResultReward
+reward_space_kwargs: {}
+
+## TRAINING params
+## ENV params
+# 12x12 only: ~77 SPS vs ~45 on mixed maps, so more steps per hour.
+map_size: 12
+
+total_steps: 500000
+num_actors: 2
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+seed: 42
+
+## MODEL params
+model_arch: conv_model
+n_blocks: 24
+hidden_dim: 128
+embedding_dim: 32
+n_merge_layers: 1
+normalize: False
+sum_player_embeddings: False
+use_index_select: False
+rescale_value_input: True
+rescale_se_input: True
+kernel_size: 5
+
+## OPTIMIZER params
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 1e-5
+  eps: 0.0003
+min_lr_mod: 1.0
+
+## LOSS params
+entropy_cost: 2e-6
+baseline_cost: 1.
+teacher_kl_cost: 0.001
+teacher_baseline_cost: 0.0
+lmb: 0.9
+reduction: sum
+
+# Frozen teacher for the KL loss (orthogonal to the league - do not remove)
+use_teacher: True
+teacher_load_dir: C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+teacher_checkpoint_file: 062179520_weights.pt
+
+## LEAGUE params (see lux_ai/league/)
+# NB: map size does not need randomizing here - the engine already picks from
+# {12, 16, 24, 32} pseudo-randomly per seed, and the seed increments per reset.
+league:
+  enabled: true
+  pool_size: 10
+  # Permanent members, never evicted. ALL external agents belong here, not in
+  # initial_members: pool.offer() evicts uniformly at random from the non-anchor
+  # reservoir and does not special-case kind=EXTERNAL, so a seeded external
+  # competes with every snapshot for a slot. In the 5M run (08-16/17-52-06) both
+  # seeded externals were evicted and the pool finished as 2 anchors + 8 of the
+  # agent's own snapshots - i.e. it was training almost entirely against itself.
+  # Only 3 independent external agents exist, so with pool_size 10 the pool is
+  # still majority self-play; that is the ceiling until more are generated.
+  # Held out on purpose, so evaluation means something - do NOT add:
+  #   hall_of_fame/11-09_21-32-04_59822400  (reserved held-out opponent)
+  #   hall_of_fame/09-17_22-05-30_20000128  (old obs space; rejected anyway)
+  # (hall_of_fame/09-07_01-44-10_10088000 cannot be rebuilt by current code.)
+  # (hall_of_fame/10-10_..._must_research has weights identical to 10-10 above.)
+  anchors:
+  - C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research
+  - C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/hall_of_fame/10-10_11-18-12_28576448
+  - C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/internal_agents/10-02_11-29-02_20000192
+  - C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/internal_agents/10-08_17-35-45_20000192
+  initial_members: []
+  # --- fixed-seed evaluation against the anchors (see league/README.md) ---
+  # Watch AnchorEval/win_rate_mean. AnchorEval/win_rate/11-24... is the single most
+  # interpretable series: that checkpoint is what this run starts FROM, so crossing
+  # below 0.5 means the agent is now worse than where it began.
+  # COST: 5 seeds x 2 map sizes x 2 seats = 20 games/anchor x 4 anchors = 80 games
+  # per round, ~19 min idle and more under contention. At every_n_games: 500 that is
+  # ~12.7 rounds and roughly +4 h on a 22 h run. Double every_n_games to halve it.
+  anchor_eval_enabled: True
+  anchor_eval_every_n_games: 500
+  anchor_eval_n_seeds: 5
+  anchor_eval_map_sizes: [16, 32]
+  anchor_eval_parallel_games: 8
+  anchor_eval_at_start: True
+  # Real settings, not the smoke values: 50 games is +-7 points, and the
+  # cooldown stops a sustained streak admitting on every main-loop tick.
+  winrate_admit_threshold: 0.6
+  winrate_admit_window: 50
+  winrate_admit_cooldown_updates: 500
+  mirror_frac: 0.5
+  snapshot_interval_updates: 500
+  priority: pfsp        # pfsp | variance | uniform
+  alpha: 0.5
+  eps_uniform: 0.1
+  # minimum share of league games per permanent anchor: keeps the fixed
+  # yardstick supplied with data even when PFSP would stop sampling it
+  anchor_floor: 0.15
+  # rolling window (in games, not steps) for the anchor win-rate report
+  anchor_report_every_n_games: 100
+  winrate_lambda: 0.1
+  winrate_init: 0.5
+  max_loaded_opponents: 8
+  opponent_sample: true
+
+# MISCELLANEOUS params
+actor_device: cuda:0
+learner_device: cuda:0
+model_log_freq: 100
+# file_system on Windows (file_descriptor is Linux-only)
+sharing_strategy: file_system
+disable_wandb: False
+debug: False
+
+# Fine-tune from the released checkpoint (never train from scratch)
+load_dir: C:/Users/_s2111724/2026_summer_camp/LuxAI/LuxAI_league_16block/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+checkpoint_file: 062179520_weights.pt
+weights_only: True
+checkpoint_freq: 30
+n_value_warmup_batches: 0

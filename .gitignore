@@ -8,3 +8,5 @@ __pycache__/
 
 # Evaluation outputs
 evaluation_runs/
+internal_testing/
+league_agents/

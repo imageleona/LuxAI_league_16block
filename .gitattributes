@@ -1,0 +1,5 @@
+*.pt filter=lfs diff=lfs merge=lfs -text
+
+# Checksum manifests must keep LF endings: git autocrlf turns them into CRLF on
+# checkout, and sha256sum then looks for filenames with a trailing CR.
+league/weights.sha256 text eol=lf

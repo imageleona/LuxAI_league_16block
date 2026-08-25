@@ -1,0 +1,167 @@
+================================================================================
+RUN SETUP - league_haruto_16block_distill
+================================================================================
+Workspace : C:\Users\_s2111724\2026_summer_camp\LuxAI\LuxAI_league_16block
+Config    : conf/league_haruto_16block_distill.yaml
+Started   : (fill in)
+
+PURPOSE
+  Single-variable test of the FROZEN TEACHER. Identical to the killed run
+  (outputs/08-24/21-41-03) except use_teacher and teacher_kl_cost, so any
+  difference is attributable to the teacher alone.
+
+  Why this is not just another anchor: in every previous run the teacher WAS the
+  starting checkpoint (11-24 fine-tuning 11-24), so the KL term could only hold
+  the policy where it already was. Here the teacher is strong (19.9M params,
+  62M steps) and the student is weak (7.4M, 40k steps, 0.146 vs anchors), so the
+  KL is a gradient TOWARD a better policy. This is distillation, and it is the
+  first mechanism tried that has a route to improvement rather than to stability.
+
+--------------------------------------------------------------------------------
+COMMAND
+--------------------------------------------------------------------------------
+  conda activate C:\Users\_s2111724\2026_summer_camp\LuxAI\lux_env37
+  cd C:\Users\_s2111724\2026_summer_camp\LuxAI\LuxAI_league_16block
+  python run_monobeast.py --config-name league_haruto_16block_distill
+
+  (no map_size arg      -> random {12, 16, 24, 32})
+  (no disable_wandb arg -> wandb ON)
+
+--------------------------------------------------------------------------------
+THE ONLY CHANGES FROM THE KILLED RUN
+--------------------------------------------------------------------------------
+                        killed run      this run
+  use_teacher           False           True
+  teacher_kl_cost       0.0             0.1
+
+  MEASURED, not inherited. On this student/teacher pair with an on-policy batch,
+  the teacher-KL gradient as a fraction of the policy gradient:
+
+      teacher_kl_cost   KL / PG
+      0.001              0.1%     <- our old league configs: effectively inert
+      0.005              0.6%     <- phase 5
+      0.02               2.3%     <- team-g, the highest attested value
+      0.1               11.5%     <- THIS RUN
+      0.5               58%
+      2.0              230%       <- KL dominates; imitation, not RL
+
+  Every attested value (0.001-0.02) anchors a model to its OWN predecessor, where
+  a ~1% nudge is the right size. Distilling from a stronger, different model is a
+  different job and nothing in either repo is calibrated for it. 0.1 gives the
+  teacher real influence while the RL signal still dominates.
+
+  NB: entropy_cost 2e-4 and min_lr_mod 0.01 were ALREADY in the killed run. They
+  are NOT changes here. The earlier claim that our configs used 2e-6 / 1.0 applies
+  to league_pfsp.yaml and the four 24x128 runs, NOT to this architecture.
+
+--------------------------------------------------------------------------------
+TEACHER
+--------------------------------------------------------------------------------
+  use_teacher             True
+  teacher_load_dir        internal_testing/hall_of_fame/
+                            11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+  teacher_checkpoint_file 062179520_weights.pt
+  teacher_kl_cost         0.1        (~11.5% of the policy gradient, measured)
+  teacher_baseline_cost   0.0        (policy is distilled, value head is not)
+
+  Cross-architecture, verified to build and load:
+    student   16 blocks x  96   =  7,447,976 params
+    teacher   24 blocks x 128   = 19,867,689 params
+    obs space shared (FixedShapeContinuousObsV2) -> no MultiObs, prefix ""
+
+--------------------------------------------------------------------------------
+MODEL / OPTIMISER  (unchanged from the killed run)
+--------------------------------------------------------------------------------
+  n_blocks 16 | hidden_dim 96 | embedding_dim 32 | kernel_size 5
+  adaptive_embedding_dims True | adaptive_embedding_max_values 4
+  use_index_select True | n_merge_layers 1 | normalize False
+  sum_player_embeddings False
+
+  lr 1.0e-06 | min_lr_mod 0.01 | eps 3e-4 | Adam
+  entropy_cost 2.0e-04 | baseline_cost 1.0 | lmb 0.8
+  clip_grads 10.0 | reduction sum
+
+  Starting policy: league_agents/haruto_16block (the shared 40k checkpoint)
+
+--------------------------------------------------------------------------------
+LEAGUE  (unchanged)
+--------------------------------------------------------------------------------
+  pool_size 10 | mirror_frac 0.5 | priority pfsp (alpha 0.5, eps_uniform 0.1)
+  anchor_floor 0.12  -> 5 anchors x 0.12 = 60% of league games
+  snapshot_interval_updates 500 (~32k steps)
+
+  ANCHORS:  haruto_16block  <- gate reference, the checkpoint this run starts from
+            11-24_12-56-23_062179520_must_research   <- also the teacher
+            10-10_11-18-12_28576448
+            10-02_11-29-02_20000192
+            10-08_17-35-45_20000192
+
+  GATE:     winrate_admit_threshold 0.7 | reference haruto_16block
+            window 50 games | cooldown 500 updates
+            (never fired in the killed run - reference wr fell to 0.140)
+
+--------------------------------------------------------------------------------
+REWARD / ENV  (unchanged)
+--------------------------------------------------------------------------------
+  reward_space   GameResultReward   (+1 win / 0 draw / -1 loss)
+  map_size       random {12, 16, 24, 32}
+  total_steps    999360
+  num_actors 2 | n_actor_envs 16 | unroll_length 16 | batch_size 4
+
+--------------------------------------------------------------------------------
+EVALUATION
+--------------------------------------------------------------------------------
+  anchor_eval_enabled True | n_seeds 3 | map_sizes [12,16,24,32]
+  every 500 league games | parallel_games 8
+  -> 24 games per anchor, 120 games per round across 5 anchors
+
+--------------------------------------------------------------------------------
+BASELINE TO BEAT  (from the killed run, same seeds, same start)
+--------------------------------------------------------------------------------
+                              round 1 (step 0)   round 2 (step 371,456)
+  mean over 5 anchors           0.2167             0.1417
+  vs haruto_16block (own init)  0.500  margin 0    0.250  margin -8.79
+  vs 11-24                      0.2083             0.1667
+  vs 10-02 / 10-08 / 10-10      0.250/0.083/0.042  0.167/0.083/0.042
+
+  Round 1 must reproduce 0.2167 exactly - same checkpoint, same fixed seeds. If
+  it does not, something changed in the setup that should not have.
+
+--------------------------------------------------------------------------------
+WHAT TO CHECK
+--------------------------------------------------------------------------------
+  FIRST 15 MIN: Loss/teacher_kl_loss vs Loss/vtrace_pg_loss.
+    Expect the KL term around 10% of the policy-gradient term. Far below that and
+    the teacher is not leading; far above and it has become imitation learning.
+
+  Loss/total_loss reads NaN whenever use_teacher is True - a known reporting
+  artifact (0 * -inf on masked actions). Gradients stay finite. Monitor
+  vtrace_pg_loss / upgo_pg_loss / baseline_loss / entropy_loss instead.
+
+  AnchorEval/win_rate_mean             the headline
+  AnchorEval/win_rate/haruto_16block   cleanest signal: above 0.5 means it beat
+                                       its own starting policy
+  League/reference_winrate             gate signal; needs 0.7 to fire
+  League/effective_pool_size           collapse to 2-3 = pool degenerated
+
+--------------------------------------------------------------------------------
+EXPECTATIONS
+--------------------------------------------------------------------------------
+  ~89 SPS observed -> 999360 steps ~= 3.1 h training
+  ~3 eval rounds x ~60 min (120 games x ~31 s), threaded, ~10% contention
+  ~4-5 h total | ~3 GB disk
+
+  wandb: project Lux_AI_2021_league, entity models-university-of-tsukuba,
+         group haruto_16block, name league_haruto_16block_distill
+
+--------------------------------------------------------------------------------
+OUTPUT
+--------------------------------------------------------------------------------
+  outputs/<MM-DD>/<HH-MM-SS>/
+      config.yaml                            fully resolved
+      run_monobeast.log
+      league/outcomes.jsonl                  one line per league game
+      league/state.json                      pool + win rates
+      league/snapshots/                      <step>/ and <step>_wr/
+      league/anchor_eval/anchor_eval.txt     <- the results
+      league/anchor_eval/anchor_eval.jsonl

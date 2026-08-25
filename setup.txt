@@ -1,0 +1,165 @@
+================================================================================
+RUN SETUP - league_haruto_16block_gated
+================================================================================
+Workspace : C:\Users\_s2111724\2026_summer_camp\LuxAI\LuxAI_league_16block
+Config    : conf/league_haruto_16block_gated.yaml
+Started   : (fill in)
+Purpose   : 1M-step PFSP league fine-tune of the team-g 16-block architecture,
+            with win-rate-gated pool admission ON and the optimiser corrected to
+            the values this checkpoint was actually trained with.
+
+--------------------------------------------------------------------------------
+COMMAND
+--------------------------------------------------------------------------------
+  conda activate C:\Users\_s2111724\2026_summer_camp\LuxAI\lux_env37
+  cd C:\Users\_s2111724\2026_summer_camp\LuxAI\LuxAI_league_16block
+  python run_monobeast.py --config-name league_haruto_16block_gated
+
+  (no map_size argument     -> random {12, 16, 24, 32} per episode)
+  (no disable_wandb argument -> wandb ON, the config already sets it False)
+
+--------------------------------------------------------------------------------
+MODEL   7,447,976 parameters   (ours for comparison: 19.8M at 24 x 128)
+--------------------------------------------------------------------------------
+  model_arch                  conv_model
+  n_blocks                    16
+  hidden_dim                  96
+  embedding_dim               32
+  adaptive_embedding_dims     True     <- required to load this checkpoint
+  adaptive_embedding_max_values  4     <- 2-value features -> dim 1, board_size -> 2
+  use_index_select            True
+  kernel_size                 5
+  n_merge_layers              1
+  normalize                   False
+  sum_player_embeddings       False
+
+  Starting policy: league_agents/haruto_16block (their 40k checkpoint, weights only)
+
+--------------------------------------------------------------------------------
+OPTIMISER   corrected to Haruto's values
+--------------------------------------------------------------------------------
+                        this run     previous run     source
+  lr                    1.0e-06      1.0e-05          theirs
+  min_lr_mod            0.01         1.0              theirs
+  entropy_cost          2.0e-04      2.0e-06          theirs
+  lmb                   0.8          0.9              theirs
+  optimizer             Adam, eps 3e-4
+  baseline_cost         1.0
+  clip_grads            10.0
+  reduction             sum
+
+  Why: the previous run used OUR lr (1e-5), 10x what this checkpoint was trained
+  at, and the anchor win rate fell 0.146 -> 0.073 over 358k steps.
+
+--------------------------------------------------------------------------------
+LEAGUE
+--------------------------------------------------------------------------------
+  pool_size                   10
+  mirror_frac                 0.5        (half the games are ordinary self-play)
+  priority                    pfsp       weight = (1 - winrate) ^ alpha
+  alpha                       0.5
+  eps_uniform                 0.1
+  anchor_floor                0.12       5 anchors x 0.12 = 60% of league games
+  snapshot_interval_updates   500        (~32k env steps)
+  winrate_lambda              0.1
+
+  ANCHORS (permanent, never evicted):
+    haruto_16block        <- the checkpoint this run STARTS from = gate reference
+    11-24_12-56-23_062179520_must_research
+    10-10_11-18-12_28576448
+    10-02_11-29-02_20000192
+    10-08_17-35-45_20000192
+
+  WIN-RATE GATED ADMISSION (on):
+    winrate_admit_threshold        0.7
+    winrate_admit_reference        haruto_16block
+    winrate_admit_window           50 games
+    winrate_admit_cooldown_updates 500
+
+    Reference is the STARTING checkpoint, not 11-24. The agent wins only 3.5% of
+    games vs 11-24, so a 0.7 bar there could never fire. Against its own starting
+    policy the window begins near 0.5, and 0.7 means genuine improvement.
+
+  Standalone exploiter stop rule: OFF (exploiter_target_winrate 0.0)
+
+--------------------------------------------------------------------------------
+REWARD / ENV
+--------------------------------------------------------------------------------
+  reward_space                GameResultReward     (+1 win / 0 draw / -1 loss)
+  research-timing reward      OFF - clean baseline, one variable at a time
+  use_teacher                 False
+  map_size                    random {12, 16, 24, 32}
+  total_steps                 999360
+  num_actors 2 | n_actor_envs 16 | unroll_length 16 | batch_size 4
+
+  NB: `step` advances by unroll_length x batch_size = 64 per learner update, NOT
+  per game turn. 999360 is a multiple of both 64 and 360, but that does not align
+  game boundaries - 32 envs run staggered, so ~32 games are always mid-play when
+  the run stops.
+
+--------------------------------------------------------------------------------
+EVALUATION (fixed seeds, deployment inference path)
+--------------------------------------------------------------------------------
+  anchor_eval_enabled         True
+  anchor_eval_n_seeds         3
+  anchor_eval_map_sizes       [12, 16, 24, 32]
+  anchor_eval_every_n_games   500 league games
+  anchor_eval_parallel_games  8
+  -> 3 x 4 x 2 = 24 games per anchor, 120 games per round with 5 anchors
+
+--------------------------------------------------------------------------------
+EXPECTATIONS
+--------------------------------------------------------------------------------
+  Throughput      ~51 SPS  ->  999360 steps ~= 5.5 h training
+  Eval rounds     ~3 (step 0, then every ~350k steps)
+  Per round       120 games x ~31 s = ~62 min (threaded, ~10% contention)
+  Total wall      ~6 h
+  Disk            ~30 snapshots x 30 MB + checkpoints ~= 3 GB
+
+  BASELINE TO BEAT: mean anchor win rate 0.146 at step 0
+  (previous run, 96 games, fixed seeds, all four map sizes)
+
+  Watch:  AnchorEval/win_rate_mean      - the headline
+          League/reference_winrate      - if it never nears 0.7 the gate stays shut
+          League/effective_pool_size    - collapse to 2-3 = pool degenerated
+
+--------------------------------------------------------------------------------
+WANDB  (on)
+--------------------------------------------------------------------------------
+  project   Lux_AI_2021_league
+  entity    null -> resolves to models-university-of-tsukuba
+  group     haruto_16block
+  name      league_haruto_16block_gated
+
+  Panels to watch:
+    AnchorEval/win_rate_mean      headline; baseline to beat is 0.146
+    AnchorEval/win_rate/<anchor>   per anchor, 24 games each - noisy alone
+    League/reference_winrate       the gate signal; if it never nears 0.7 the
+                                   gate stays shut and this is a plain baseline
+    League/effective_pool_size     1/sum(p^2); collapse to 2-3 = pool degenerated
+    Loss/vtrace_pg_loss, upgo_pg_loss, baseline_loss, entropy_loss
+    Loss/total_loss                NaN by design - a known reporting artifact from
+                                   teacher_kl (0 * -inf); gradients stay finite
+
+  AnchorEval panels use their OWN x-axis. A round takes ~1 h, during which the
+  learner keeps advancing `step`; wandb needs non-decreasing steps, so the result
+  is logged at the step reached when the round FINISHES. monobeast calls
+  wandb.define_metric("AnchorEval/*", step_metric="AnchorEval/eval_step") so the
+  charts re-base onto the step the weights were actually frozen at.
+
+  NB: a wandb filestream 404 on this same project hung a run for 20 min on 08-23
+  without training a step. The account and project check out now (16 runs
+  reachable). If it recurs, add disable_wandb=True - outcomes.jsonl, state.json
+  and anchor_eval.txt are written to disk regardless.
+
+--------------------------------------------------------------------------------
+OUTPUT
+--------------------------------------------------------------------------------
+  outputs/<MM-DD>/<HH-MM-SS>/
+      config.yaml                       fully resolved config
+      run_monobeast.log
+      league/outcomes.jsonl             one line per league game
+      league/state.json                 pool + win rates
+      league/snapshots/                 <step>/ and <step>_wr/ (gate-admitted)
+      league/anchor_eval/anchor_eval.txt    <- the results
+      league/anchor_eval/anchor_eval.jsonl
