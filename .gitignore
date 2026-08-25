@@ -1,0 +1,10 @@
+
+# Training outputs
+outputs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Evaluation outputs
+evaluation_runs/
