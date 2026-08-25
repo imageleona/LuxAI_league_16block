@@ -76,6 +76,10 @@ The list should include
 opponents under `internal_testing/` referenced by
 `conf/league_haruto_16block.yaml`.
 
+ADD THESE FOLDERS FROM GOOGLE DRIVE IN THE MAIN FOLDER:
+https://drive.google.com/drive/folders/14anheutHIDDFXqNTtgl8poq0MC3C_AKA?usp=sharing
+
+
 ## 3. Code guide and running the league
 
 ### What each part does
