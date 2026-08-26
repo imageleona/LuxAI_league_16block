@@ -24,7 +24,6 @@ import timeit
 import traceback
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple, Union
-import wandb
 import warnings
 
 import torch
@@ -49,6 +48,12 @@ logging.basicConfig(
     ),
     level=0,
 )
+
+
+def _get_wandb():
+    """Import the optional tracker only when a run actually enables it."""
+    import wandb
+    return wandb
 
 
 def combine_policy_logits_to_log_probs(
@@ -215,6 +220,50 @@ def compute_policy_gradient_loss(
     return reduce(cross_entropy * advantages.detach(), reduction)
 
 
+def _checkpoint_component(checkpoint_state: Dict, key: str, flag_name: str):
+    """Return a requested checkpoint component with a useful failure message."""
+    if key not in checkpoint_state:
+        raise ValueError(
+            "{}=True, but the selected checkpoint has no '{}'. "
+            "Use the full .pt checkpoint or disable {}.".format(
+                flag_name, key, flag_name
+            )
+        )
+    return checkpoint_state[key]
+
+
+def _restore_optimizer(
+        optimizer: torch.optim.Optimizer,
+        checkpoint_state: Optional[Dict],
+        flags: SimpleNamespace,
+) -> None:
+    if checkpoint_state is None or not flags.load_optimizer_state:
+        return
+    optimizer.load_state_dict(_checkpoint_component(
+        checkpoint_state, "optimizer_state_dict", "load_optimizer_state"
+    ))
+    if not flags.load_scheduler_state:
+        # optimizer.load_state_dict also restores the old param-group learning
+        # rate. For an optimizer-only experiment we want the moments, not the
+        # previous stage's terminal LR (1e-8 in the Haruto 40k checkpoint).
+        configured_lr = float(flags.optimizer_kwargs["lr"])
+        for group in optimizer.param_groups:
+            group["lr"] = configured_lr
+            group["initial_lr"] = configured_lr
+
+
+def _restore_scheduler(
+        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        checkpoint_state: Optional[Dict],
+        flags: SimpleNamespace,
+) -> None:
+    if checkpoint_state is None or not flags.load_scheduler_state:
+        return
+    scheduler.load_state_dict(_checkpoint_component(
+        checkpoint_state, "scheduler_state_dict", "load_scheduler_state"
+    ))
+
+
 @torch.no_grad()
 def act(
         flags: SimpleNamespace,
@@ -268,7 +317,9 @@ def act(
 
                 agent_output = actor_model(env_output)
                 if league_client is not None:
-                    league_client.apply_opponent_actions(env_output, agent_output)
+                    league_client.apply_opponent_actions(
+                        env_output, agent_output, unwrapped_envs=env.unwrapped
+                    )
                     # The mask stored alongside these actions must reflect the
                     # seat assignment they were sampled under, so capture it
                     # before any end-of-episode re-assignment below.
@@ -710,8 +761,8 @@ def train(flags):
             # would put the step-0 baseline at ~200k on the default axis. Re-base the
             # AnchorEval panels onto eval_step so each point sits where it was
             # actually measured. Define the step metric first.
-            wandb.define_metric("AnchorEval/eval_step")
-            wandb.define_metric("AnchorEval/*", step_metric="AnchorEval/eval_step")
+            _get_wandb().define_metric("AnchorEval/eval_step")
+            _get_wandb().define_metric("AnchorEval/*", step_metric="AnchorEval/eval_step")
 
     actor_processes = []
     free_queue = mp.SimpleQueue()
@@ -742,14 +793,13 @@ def train(flags):
     learner_model.train()
     learner_model = learner_model.share_memory()
     if not flags.disable_wandb:
-        wandb.watch(learner_model, flags.model_log_freq, log="all", log_graph=True)
+        _get_wandb().watch(learner_model, flags.model_log_freq, log="all", log_graph=True)
 
     optimizer = flags.optimizer_class(
         learner_model.parameters(),
         **flags.optimizer_kwargs
     )
-    if checkpoint_state is not None and not flags.weights_only:
-        optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
+    _restore_optimizer(optimizer, checkpoint_state, flags)
 
     # Load teacher model for KL loss
     if flags.use_teacher:
@@ -788,11 +838,10 @@ def train(flags):
 
     grad_scaler = amp.GradScaler()
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    if checkpoint_state is not None and not flags.weights_only:
-        scheduler.load_state_dict(checkpoint_state["scheduler_state_dict"])
+    _restore_scheduler(scheduler, checkpoint_state, flags)
 
     step, total_games_played, stats = 0, 0, {}
-    if checkpoint_state is not None and not flags.weights_only:
+    if checkpoint_state is not None and flags.resume_training_counters:
         if "step" in checkpoint_state.keys():
             step = checkpoint_state["step"]
         # Backwards compatibility
@@ -843,7 +892,7 @@ def train(flags):
                 with lock:
                     step += t * b
                     if not flags.disable_wandb:
-                        wandb.log(stats, step=step)
+                        _get_wandb().log(stats, step=step)
             timings.time("learn")
         if learner_idx == 0:
             logging.info(f"Batch and learn timing statistics: {timings.summary()}")
@@ -915,7 +964,7 @@ def train(flags):
                 if n_outcomes > 0 or took_snapshot:
                     league_manager.publish()
                 if not flags.disable_wandb:
-                    wandb.log(league_manager.wandb_stats(), step=step)
+                    _get_wandb().log(league_manager.wandb_stats(), step=step)
 
                 # NB: the whole block is guarded. The enclosing try only catches
                 # KeyboardInterrupt, so anything escaping here would kill a
@@ -923,15 +972,38 @@ def train(flags):
                 if anchor_eval is not None:
                     try:
                         anchor_eval.note_games(n_outcomes)
+                        # Poll before starting a new round: the candidate directory
+                        # still contains the weights that produced the completed
+                        # result, so save-best cannot accidentally preserve the
+                        # next candidate under the previous score.
+                        payload = anchor_eval.poll(step)
+                        if payload is not None and not flags.disable_wandb:
+                            _get_wandb().log(payload, step=step)
+                        for best_record in anchor_eval.pop_new_best_records():
+                            previous_best = best_record.get("previous_best_mean_win_rate")
+                            delta = float(best_record.get("delta_from_baseline", 0.0))
+                            if (
+                                    league_flags.anchor_eval_promote_best
+                                    and previous_best is not None
+                                    and delta >= league_flags.anchor_eval_promotion_min_delta
+                            ):
+                                admitted = league_manager.admit_evaluated_snapshot(
+                                    anchor_eval.best_dir,
+                                    best_record.get("step", step),
+                                    best_record.get("round", 0),
+                                )
+                                if admitted is not None:
+                                    logging.info(
+                                        "League: fixed-eval promoted %s (delta from baseline %+.4f)",
+                                        admitted.member_id, delta,
+                                    )
+                                    league_manager.publish()
                         if anchor_eval.due():
                             anchor_eval.start(
                                 lambda d, f: league_manager.write_agent_dir(
                                     actor_model.state_dict(), d, f),
                                 step,
                             )
-                        payload = anchor_eval.poll(step)
-                        if payload is not None and not flags.disable_wandb:
-                            wandb.log(payload, step=step)
                     except Exception:
                         logging.exception("Anchor evaluation failed; training continues")
 
@@ -970,11 +1042,23 @@ def train(flags):
         if anchor_eval is not None:
             try:
                 anchor_eval.shutdown()
+                payload = anchor_eval.poll(step)
+                if payload is not None and not flags.disable_wandb:
+                    _get_wandb().log(payload, step=step)
             except Exception:
                 logging.exception("Anchor evaluation shutdown failed")
         for _ in range(flags.num_actors):
             free_queue.put(None)
         for actor in actor_processes:
-            actor.join(timeout=1)
+            actor.join(timeout=10)
+            if actor.is_alive():
+                logging.warning("Actor %s did not exit within 10 seconds", actor.pid)
+        if league_manager is not None:
+            try:
+                league_manager.write_agent_dir(
+                    actor_model.state_dict(), run_dir / "final_agent", "final_weights.pt"
+                )
+            except Exception:
+                logging.exception("Could not export final_agent; regular checkpoint still follows")
         cp_path = str(step).zfill(int(math.log10(flags.total_steps)) + 1)
         checkpoint(cp_path)

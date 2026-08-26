@@ -11,7 +11,6 @@ import sys
 from omegaconf import OmegaConf, DictConfig
 from pathlib import Path
 from torch import multiprocessing as mp
-import wandb
 
 from lux_ai.utils import flags_to_namespace
 from lux_ai.torchbeast.monobeast import train
@@ -61,6 +60,16 @@ def get_default_flags(flags: DictConfig) -> DictConfig:
     flags.setdefault("load_dir", None)
     flags.setdefault("checkpoint_file", None)
     flags.setdefault("weights_only", False)
+    # Backwards-compatible checkpoint controls. Historically weights_only=False
+    # meant four separate things at once: load the saved config, Adam state,
+    # scheduler state, and training counters. Keeping those choices independent
+    # makes continuation experiments attributable and avoids inheriting an
+    # exhausted scheduler merely to recover Adam's moment estimates.
+    full_resume = not flags["weights_only"]
+    flags.setdefault("resume_saved_config", full_resume)
+    flags.setdefault("load_optimizer_state", full_resume)
+    flags.setdefault("load_scheduler_state", full_resume)
+    flags.setdefault("resume_training_counters", full_resume)
     flags.setdefault("n_value_warmup_batches", 0)
 
     # Miscellaneous params
@@ -85,7 +94,10 @@ def main(flags: DictConfig):
         new_flags = OmegaConf.load("config.yaml")
         flags = OmegaConf.merge(new_flags, cli_conf)
 
-    if flags.get("load_dir", None) and not flags.get("weights_only", False):
+    resume_saved_config = flags.get(
+        "resume_saved_config", not flags.get("weights_only", False)
+    )
+    if flags.get("load_dir", None) and resume_saved_config:
         # this ignores the local config.yaml and replaces it completely with saved one
         # however, you can override parameters from the cli still
         # this is useful e.g. if you did total_steps=N before and want to increase it
@@ -99,6 +111,7 @@ def main(flags: DictConfig):
     logging.info(OmegaConf.to_yaml(flags, resolve=True))
     OmegaConf.save(flags, "config.yaml")
     if not flags.disable_wandb:
+        import wandb
         wandb.init(
             # NB: not vars(flags) - flags is a DictConfig, whose __dict__ holds
             # OmegaConf's internals rather than the settings. Current wandb

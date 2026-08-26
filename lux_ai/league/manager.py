@@ -312,6 +312,35 @@ class LeagueManager:
         self.last_snapshot_step = step
         return self._admit(snapshot_dir, kind=SNAPSHOT)
 
+    def admit_evaluated_snapshot(
+            self,
+            evaluated_agent_dir: Union[str, Path],
+            step: int,
+            round_idx: int,
+    ) -> Optional[PoolMember]:
+        """Force-admit the exact candidate that passed fixed-anchor evaluation.
+
+        The evaluator reuses its candidate and best directories, so the pool may
+        not point at either mutable location. Copy the known files into a unique,
+        permanent snapshot directory. No file is deleted or globbed.
+        """
+        source_dir = Path(evaluated_agent_dir).expanduser().resolve()
+        config_path, checkpoint_path = resolve_agent_files(source_dir)
+        name = "{:012d}_eval_{:03d}".format(int(step), int(round_idx))
+        target_dir = self.league_dir / "snapshots" / name
+        rl_dir = target_dir / "lux_ai" / "rl_agent"
+        rl_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(config_path), str(rl_dir / "config.yaml"))
+        source_agent_config = config_path.parent / "rl_agent_config.yaml"
+        if source_agent_config.is_file():
+            shutil.copy2(str(source_agent_config), str(rl_dir / "rl_agent_config.yaml"))
+        final_path = rl_dir / (name + "_weights.pt")
+        tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+        shutil.copy2(str(checkpoint_path), str(tmp_path))
+        if not replace_with_retry(tmp_path, final_path):
+            raise OSError("could not publish evaluated snapshot {}".format(final_path))
+        return self._admit(target_dir, kind=SNAPSHOT, force=True)
+
     def reference_id(self) -> Optional[str]:
         """
         The anchor the win-rate admission gate measures against. Defaults to the first

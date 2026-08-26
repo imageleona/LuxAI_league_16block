@@ -82,6 +82,11 @@ class LuxEnv(gym.Env):
         self.board_dims = MAX_BOARD_SIZE
         self.run_game_automatically = run_game_automatically
         self.restart_subproc_after_n_resets = restart_subproc_after_n_resets
+        # Keep both players' engine update streams so an optional deployed
+        # opponent can consume the same Kaggle observation that it sees in an
+        # actual match. Action overrides are one-shot and cleared every step.
+        self._player_updates: List[List[str]] = [[], []]
+        self._player_action_overrides: Dict[int, List[str]] = {}
 
         self.game_state = Game()
         if configuration is not None:
@@ -124,6 +129,7 @@ class LuxEnv(gym.Env):
 
     def reset(self, observation_updates: Optional[List[str]] = None) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         self.game_state = Game()
+        self._player_action_overrides = {}
         self.reset_count = (self.reset_count + 1) % self.restart_subproc_after_n_resets
         # There seems to be a gradual memory leak somewhere, so we restart the dimension process every once in a while
         if self.reset_count == 0:
@@ -140,8 +146,11 @@ class LuxEnv(gym.Env):
             self._dimension_process.stdin.write((json.dumps(initiate) + "\n").encode())
             self._dimension_process.stdin.flush()
             agent1res = json.loads(self._dimension_process.stderr.readline())
-            # Skip agent2res and match_obs_meta
-            _ = self._dimension_process.stderr.readline(), self._dimension_process.stderr.readline()
+            agent2res = json.loads(self._dimension_process.stderr.readline())
+            # match_obs_meta is not needed for training, but still has to be
+            # consumed from the dimensions protocol.
+            _ = self._dimension_process.stderr.readline()
+            self._player_updates = [agent1res, agent2res]
 
             self.game_state._initialize(agent1res)
             self.game_state._update(agent1res[2:])
@@ -170,6 +179,13 @@ class LuxEnv(gym.Env):
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         if self.run_game_automatically:
             actions_processed, actions_taken = self.process_actions(action)
+            for player, commands in self._player_action_overrides.items():
+                actions_processed[player] = list(commands)
+                # The overridden commands came from a frozen opponent, not the
+                # behaviour policy recorded in this rollout.
+                for value in actions_taken.values():
+                    value[:, player] = False
+            self._player_action_overrides = {}
             self._step(actions_processed)
             self.info["actions_taken"] = actions_taken
         self._update_internal_state()
@@ -179,6 +195,18 @@ class LuxEnv(gym.Env):
     def manual_step(self, observation_updates: List[str]) -> NoReturn:
         assert not self.run_game_automatically
         self.game_state._update(observation_updates)
+
+    def override_player_actions(self, player: int, commands: List[str]) -> None:
+        """Use already processed Lux commands for one player on the next step."""
+        if player not in (0, 1):
+            raise ValueError(f"player must be 0 or 1, was {player}")
+        self._player_action_overrides[player] = list(commands)
+
+    def player_updates(self, player: int) -> List[str]:
+        """Return a defensive copy of the latest Kaggle updates for a player."""
+        if player not in (0, 1):
+            raise ValueError(f"player must be 0 or 1, was {player}")
+        return list(self._player_updates[player])
 
     def get_obs_reward_done_info(self) -> Tuple[Game, Tuple[float, float], bool, Dict]:
         rewards = self.default_reward_space.compute_rewards(game_state=self.game_state, done=self.done)
@@ -203,8 +231,10 @@ class LuxEnv(gym.Env):
 
         # 3.1 : Receive and parse the observations returned by dimensions via stdout
         agent1res = json.loads(self._dimension_process.stderr.readline())
-        # Skip agent2res and match_obs_meta
-        _ = self._dimension_process.stderr.readline(), self._dimension_process.stderr.readline()
+        agent2res = json.loads(self._dimension_process.stderr.readline())
+        # match_obs_meta is not needed for training.
+        _ = self._dimension_process.stderr.readline()
+        self._player_updates = [agent1res, agent2res]
         self.game_state._update(agent1res)
 
         # Check if done

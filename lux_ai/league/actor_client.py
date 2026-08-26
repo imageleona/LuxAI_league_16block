@@ -13,7 +13,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -40,6 +40,23 @@ class EnvAssignment:
         return 1 - self.learner_seat
 
 
+class _Observation(dict):
+    """Kaggle-compatible observation used by the deployed RLAgent wrapper."""
+
+    def __init__(self, player_id: int, step: int, updates: List[str]):
+        super().__init__(
+            step=int(step), updates=list(updates), player=int(player_id),
+            remainingOverageTime=60.0,
+        )
+        self.player = int(player_id)
+
+
+@dataclass
+class LoadedOpponent:
+    model: torch.nn.Module
+    flags: SimpleNamespace
+
+
 def _nested_index(x: Union[Dict, torch.Tensor], idx: torch.Tensor) -> Union[Dict, torch.Tensor]:
     if isinstance(x, dict):
         return {key: _nested_index(val, idx) for key, val in x.items()}
@@ -49,38 +66,46 @@ def _nested_index(x: Union[Dict, torch.Tensor], idx: torch.Tensor) -> Union[Dict
 class OpponentModelCache:
     """LRU cache of frozen opponent models resident on the actor device."""
 
-    def __init__(self, flags: SimpleNamespace, teacher_flags: Optional[SimpleNamespace], max_size: int):
+    def __init__(self, flags: SimpleNamespace, teacher_flags: Optional[SimpleNamespace],
+                 max_size: int, inference_mode: str = "raw"):
         self.device = flags.actor_device
         self.max_size = max(1, max_size)
+        self.inference_mode = inference_mode
         # Opponent models consume the training env's observations, so they are
         # built against the env obs space (+ the member's obs prefix), exactly
         # like the student/teacher models are.
         self.env_obs_space = create_flexible_obs_space(flags, teacher_flags)
-        self._models: "OrderedDict[str, torch.nn.Module]" = OrderedDict()
+        self._models: "OrderedDict[str, LoadedOpponent]" = OrderedDict()
 
-    def get(self, member: PoolMember) -> torch.nn.Module:
-        model = self._models.get(member.member_id)
-        if model is not None:
+    def get(self, member: PoolMember) -> LoadedOpponent:
+        loaded = self._models.get(member.member_id)
+        if loaded is not None:
             self._models.move_to_end(member.member_id)
-            return model
-        model = self._load(member)
-        self._models[member.member_id] = model
+            return loaded
+        loaded = self._load(member)
+        self._models[member.member_id] = loaded
         while len(self._models) > self.max_size:
-            evicted_id, evicted_model = self._models.popitem(last=False)
-            del evicted_model
+            evicted_id, evicted = self._models.popitem(last=False)
+            del evicted
             logging.info(f"League actor: unloaded opponent model {evicted_id}")
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-        return model
+        return loaded
 
-    def _load(self, member: PoolMember) -> torch.nn.Module:
+    def _load(self, member: PoolMember) -> LoadedOpponent:
         try:
             member_flags = load_member_flags(member.config_path)
+            if self.inference_mode == "deployed":
+                obs_space = member_flags.obs_space(**member_flags.obs_space_kwargs)
+                obs_space_prefix = ""
+            else:
+                obs_space = self.env_obs_space
+                obs_space_prefix = member.obs_space_prefix
             model = create_opponent_model(
                 member_flags,
                 self.device,
-                obs_space=self.env_obs_space,
-                obs_space_prefix=member.obs_space_prefix,
+                obs_space=obs_space,
+                obs_space_prefix=obs_space_prefix,
             )
             checkpoint = torch.load(member.checkpoint_path, map_location=torch.device("cpu"))
             state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -93,7 +118,7 @@ class OpponentModelCache:
                               f"from {member.checkpoint_path}")
             raise
         logging.info(f"League actor: loaded opponent model {member.member_id}")
-        return model
+        return LoadedOpponent(model=model, flags=member_flags)
 
 
 class ActorLeagueClient:
@@ -104,12 +129,22 @@ class ActorLeagueClient:
         self.n_envs = flags.n_actor_envs
         base_seed = 0 if flags.seed is None else int(flags.seed)
         self.rng = np.random.RandomState((base_seed + 7919 * (actor_index + 1)) % (2 ** 31))
-        self.cache = OpponentModelCache(flags, teacher_flags, self.league_flags.max_loaded_opponents)
+        if self.league_flags.opponent_inference_mode not in ("raw", "deployed"):
+            raise ValueError(
+                "league.opponent_inference_mode must be 'raw' or 'deployed', was {}".format(
+                    self.league_flags.opponent_inference_mode
+                )
+            )
+        self.cache = OpponentModelCache(
+            flags, teacher_flags, self.league_flags.max_loaded_opponents,
+            inference_mode=self.league_flags.opponent_inference_mode,
+        )
 
         self._version = -1
         self._members: List[PoolMember] = []
         self._probs: np.ndarray = np.zeros(0)
         self.assignments: List[EnvAssignment] = [EnvAssignment() for _ in range(self.n_envs)]
+        self._deployed_agents: List[Optional[object]] = [None for _ in range(self.n_envs)]
         # (n_envs, 2) float mask: 1 for seats controlled by the learning agent.
         self.mask = torch.ones((self.n_envs, 2), dtype=torch.float32)
         self.refresh_state()
@@ -141,6 +176,7 @@ class ActorLeagueClient:
             self.mask[env_idx] = 0.
             self.mask[env_idx, learner_seat] = 1.
         self.assignments[env_idx] = assignment
+        self._deployed_agents[env_idx] = None
         return assignment
 
     def assign_all(self) -> None:
@@ -158,6 +194,7 @@ class ActorLeagueClient:
             self,
             env_output: Dict[str, Union[Dict, torch.Tensor]],
             agent_output: Dict[str, Union[Dict, torch.Tensor]],
+            unwrapped_envs: Optional[List[object]] = None,
     ) -> None:
         """
         For every league-controlled env, overwrite the opponent seat's actions
@@ -171,6 +208,14 @@ class ActorLeagueClient:
         if not env_idxs_by_member:
             return
 
+        if self.league_flags.opponent_inference_mode == "deployed":
+            if unwrapped_envs is None or len(unwrapped_envs) != self.n_envs:
+                raise ValueError(
+                    "deployed opponent inference requires one unwrapped LuxEnv per actor env"
+                )
+            self._apply_deployed_actions(env_idxs_by_member, unwrapped_envs)
+            return
+
         # Mirrors what DictInputLayer reads, so we slice only what is needed.
         info = env_output["info"]
         model_info = {
@@ -182,7 +227,7 @@ class ActorLeagueClient:
         model_input_full = {"obs": env_output["obs"], "info": model_info}
         for member_id, env_idxs in env_idxs_by_member.items():
             member = self.assignments[env_idxs[0]].member
-            model = self.cache.get(member)
+            model = self.cache.get(member).model
             idx = torch.tensor(env_idxs, dtype=torch.long,
                                device=env_output["done"].device)
             model_input = _nested_index(model_input_full, idx)
@@ -192,6 +237,40 @@ class ActorLeagueClient:
                 for act_key, action_tensor in agent_output["actions"].items():
                     action_tensor[env_idx, :, seat] = \
                         opponent_output["actions"][act_key][slice_idx, :, seat]
+
+    def _apply_deployed_actions(
+            self,
+            env_idxs_by_member: "OrderedDict[str, List[int]]",
+            unwrapped_envs: List[object],
+    ) -> None:
+        """Run frozen opponents through the competition RLAgent action pipeline."""
+        from ..rl_agent.rl_agent import RLAgent
+
+        agent_flags = SimpleNamespace(
+            device=str(self.cache.device),
+            use_collision_detection=self.league_flags.opponent_use_collision_detection,
+            must_research=self.league_flags.opponent_must_research,
+            can_build_carts=self.league_flags.opponent_can_build_carts,
+            data_augmentations=list(self.league_flags.opponent_data_augmentations),
+        )
+        for env_idxs in env_idxs_by_member.values():
+            member = self.assignments[env_idxs[0]].member
+            loaded = self.cache.get(member)
+            for env_idx in env_idxs:
+                env = unwrapped_envs[env_idx]
+                seat = self.assignments[env_idx].opponent_seat
+                obs = _Observation(
+                    seat, env.game_state.turn, env.player_updates(seat)
+                )
+                deployed = self._deployed_agents[env_idx]
+                if deployed is None:
+                    deployed = RLAgent(
+                        obs, None, model_flags=loaded.flags,
+                        agent_flags=agent_flags, model=loaded.model,
+                    )
+                    self._deployed_agents[env_idx] = deployed
+                commands = deployed(obs, None)
+                env.override_player_actions(seat, commands)
 
     # --------------------------------------------------------------- outcome
 

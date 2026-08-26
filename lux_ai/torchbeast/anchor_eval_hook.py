@@ -24,6 +24,7 @@ import datetime as _dt
 import json
 import logging
 import queue
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
@@ -47,6 +48,7 @@ class AnchorEvalScheduler:
         self.run_dir = Path(run_dir)
         self.output_root = self.run_dir / "league" / "anchor_eval"
         self.candidate_dir = self.output_root / "candidate"
+        self.best_dir = self.output_root / "best"
         self.state_path = self.output_root / "scheduler_state.json"
         self.output_root.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +62,10 @@ class AnchorEvalScheduler:
         self._round = 0
         self._rounds_skipped = 0
         self._consecutive_failures = 0
+        self._best_mean_win_rate: Optional[float] = None
+        self._best_step: Optional[int] = None
+        self._baseline_mean_win_rate: Optional[float] = None
+        self._new_best_records: List[Dict[str, Any]] = []
         self._disabled = not config.enabled or not self._anchors
         self._pending_at_start = bool(config.at_start) and not self._disabled
         self._load_state()
@@ -86,6 +92,12 @@ class AnchorEvalScheduler:
         self._games_total = int(state.get("games_total", self._games_total))
         self._round = int(state.get("round", 0))
         self._rounds_skipped = int(state.get("rounds_skipped", 0))
+        best_mean = state.get("best_mean_win_rate")
+        self._best_mean_win_rate = None if best_mean is None else float(best_mean)
+        best_step = state.get("best_step")
+        self._best_step = None if best_step is None else int(best_step)
+        baseline = state.get("baseline_mean_win_rate")
+        self._baseline_mean_win_rate = None if baseline is None else float(baseline)
         # A resumed run already has a baseline from before the interruption.
         self._pending_at_start = False
         logging.info("AnchorEval: resumed at round %d, %d league games seen",
@@ -97,6 +109,9 @@ class AnchorEvalScheduler:
             "games_total": self._games_total,
             "round": self._round,
             "rounds_skipped": self._rounds_skipped,
+            "best_mean_win_rate": self._best_mean_win_rate,
+            "best_step": self._best_step,
+            "baseline_mean_win_rate": self._baseline_mean_win_rate,
         }
         try:
             self.state_path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
@@ -226,6 +241,7 @@ class AnchorEvalScheduler:
             except queue.Empty:
                 break
             try:
+                self._consider_best(record)
                 write_round(self.output_root, record)
             except OSError:
                 logging.exception("AnchorEval: could not write the round log")
@@ -238,6 +254,65 @@ class AnchorEvalScheduler:
                 self._note_failure()
             payload = wandb_payload(record, current_step=step)
         return payload
+
+    def _consider_best(self, record: Dict[str, Any]) -> None:
+        """Preserve the exact evaluated candidate when it sets a new best score."""
+        mean = record.get("mean_win_rate")
+        if not self.config.save_best or mean is None or not record.get("per_anchor"):
+            record["is_best"] = False
+            return
+        mean = float(mean)
+        if self._baseline_mean_win_rate is None:
+            self._baseline_mean_win_rate = mean
+        record["baseline_mean_win_rate"] = self._baseline_mean_win_rate
+        record["delta_from_baseline"] = mean - self._baseline_mean_win_rate
+        old_best = self._best_mean_win_rate
+        improved = old_best is None or mean > old_best + self.config.best_min_delta
+        record["is_best"] = improved
+        record["previous_best_mean_win_rate"] = old_best
+        if not improved:
+            return
+
+        source = self.candidate_dir / "lux_ai" / "rl_agent"
+        destination = self.best_dir / "lux_ai" / "rl_agent"
+        source_weights = source / CANDIDATE_WEIGHTS_FILENAME
+        if not source_weights.is_file():
+            raise FileNotFoundError(
+                "AnchorEval: evaluated candidate weights disappeared before best-model save: {}".format(
+                    source_weights
+                )
+            )
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in ("config.yaml", "rl_agent_config.yaml"):
+            source_file = source / name
+            if source_file.is_file():
+                shutil.copy2(str(source_file), str(destination / name))
+        # A constant name means repeated improvements overwrite one known file;
+        # no globbing or deletion of older checkpoints is needed.
+        shutil.copy2(str(source_weights), str(destination / "best_weights.pt"))
+        metadata = {
+            "step": int(record.get("step", 0)),
+            "round": int(record.get("round", 0)),
+            "mean_win_rate": mean,
+            "per_anchor": record.get("per_anchor", {}),
+        }
+        (self.best_dir / "best_metadata.json").write_text(
+            json.dumps(metadata, indent=1), encoding="utf-8"
+        )
+        self._best_mean_win_rate = mean
+        self._best_step = metadata["step"]
+        self._new_best_records.append(dict(record))
+        self._save_state()
+        logging.info(
+            "AnchorEval: new best fixed-anchor mean %.4f at step %d (previous %s)",
+            mean, self._best_step, old_best,
+        )
+
+    def pop_new_best_records(self) -> List[Dict[str, Any]]:
+        """Return newly preserved best records once, on the trainer thread."""
+        records = self._new_best_records
+        self._new_best_records = []
+        return records
 
     def _note_failure(self) -> None:
         self._consecutive_failures += 1

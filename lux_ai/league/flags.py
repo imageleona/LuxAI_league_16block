@@ -62,6 +62,17 @@ class LeagueFlags:
     # Give up permanently after this many consecutive failed rounds rather than
     # retrying a broken eval every 500 games for 20 hours.
     anchor_eval_max_consecutive_failures: int = 2
+    # Preserve the strongest fixed-anchor candidate in a stable AgentSpec
+    # directory. The latest training checkpoint is not necessarily the best one.
+    anchor_eval_save_best: bool = False
+    # Require this absolute increase over the previous best before replacing it.
+    anchor_eval_best_min_delta: float = 0.0
+    # Force-admit a new fixed-eval best into the opponent pool. The first round is
+    # only the baseline and is never promoted. A later best must clear this
+    # absolute mean-win-rate gain over that baseline. 0 with promote_best=False
+    # preserves historical behaviour.
+    anchor_eval_promote_best: bool = False
+    anchor_eval_promotion_min_delta: float = 0.0
 
     # --- main exploiter (AlphaStar-style) ---
     # An exploiter is an ordinary run pointed at a single opponent: pool_size 1, one
@@ -102,6 +113,16 @@ class LeagueFlags:
     max_loaded_opponents: int = 8
     # Sample opponent actions (True) or take argmax (False).
     opponent_sample: bool = True
+    # raw: call the frozen network directly, preserving historical league
+    # behaviour. deployed: run the frozen network through RLAgent so training
+    # opponents receive the same action legality/collision/research handling as
+    # competition agents. Deployed inference is greedy; compare raw+greedy first
+    # to isolate that change before enabling this mode.
+    opponent_inference_mode: str = "raw"
+    opponent_use_collision_detection: bool = True
+    opponent_must_research: bool = True
+    opponent_can_build_carts: bool = False
+    opponent_data_augmentations: List[str] = field(default_factory=list)
     # Absolute path of the published league state file. Set by the training
     # entrypoint before actors spawn; not meant to be set from yaml.
     state_path: Optional[str] = None

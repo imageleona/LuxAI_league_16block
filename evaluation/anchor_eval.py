@@ -52,6 +52,8 @@ class AnchorEvalConfig:
     at_start: bool = True
     blocking: bool = False
     max_consecutive_failures: int = 2
+    save_best: bool = False
+    best_min_delta: float = 0.0
 
     def __post_init__(self) -> None:
         bad = [m for m in self.map_sizes if m not in DEFAULT_MAP_SIZES]
@@ -90,6 +92,11 @@ class AnchorEvalConfig:
             at_start=bool(get("anchor_eval_at_start", True)),
             blocking=bool(get("anchor_eval_blocking", False)),
             max_consecutive_failures=int(get("anchor_eval_max_consecutive_failures", 2)),
+            save_best=bool(
+                get("anchor_eval_save_best", False)
+                or get("anchor_eval_promote_best", False)
+            ),
+            best_min_delta=float(get("anchor_eval_best_min_delta", 0.0)),
         )
 
 
@@ -236,6 +243,10 @@ def wandb_payload(record: Dict[str, Any], current_step: Optional[int] = None) ->
         "league_games_at_eval": record.get("league_games", 0),
         "failures": len(record.get("errors", {})),
         "rounds_skipped": record.get("rounds_skipped", 0),
+        "is_best": bool(record.get("is_best", False)),
+        "previous_best_mean_win_rate": record.get("previous_best_mean_win_rate"),
+        "baseline_mean_win_rate": record.get("baseline_mean_win_rate"),
+        "delta_from_baseline": record.get("delta_from_baseline"),
     }
     if current_step is not None:
         # The round finishes ~150k steps after the weights were frozen; surfacing

@@ -436,6 +436,33 @@ def test_write_agent_dir_does_not_touch_the_pool(tmp_path):
     assert list(mgr.pool.member_ids) == before
 
 
+def test_admit_evaluated_snapshot_copies_exact_candidate_without_deleting(tmp_path):
+    import torch
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    mgr = _bare_manager(run_dir)
+    source = tmp_path / "evaluated"
+    mgr.write_agent_dir({"w": torch.tensor([3.0])}, source, "best_weights.pt")
+    sentinel = source / "lux_ai" / "rl_agent" / "keep.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    admitted = {}
+    mgr._admit = lambda path, kind, force=False: admitted.update(
+        path=Path(path), kind=kind, force=force
+    ) or "member"
+
+    result = mgr.admit_evaluated_snapshot(source, step=64000, round_idx=2)
+
+    copied = (tmp_path / "run" / "league" / "snapshots" /
+              "000000064000_eval_002" / "lux_ai" / "rl_agent" /
+              "000000064000_eval_002_weights.pt")
+    state = torch.load(str(copied), map_location="cpu")
+    assert result == "member"
+    assert torch.equal(state["model_state_dict"]["w"], torch.tensor([3.0]))
+    assert admitted["force"] is True
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+
+
 # ------------------------------------------------- exploiter stop rule
 
 def _window_manager(maxlen=10):

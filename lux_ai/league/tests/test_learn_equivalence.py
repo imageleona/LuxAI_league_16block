@@ -15,6 +15,7 @@ Needs CUDA and a git checkout; skipped otherwise.
 import copy
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,6 @@ import torch
 from omegaconf import OmegaConf
 
 REPO = Path(__file__).resolve().parents[3]
-BASELINE_MODULE = REPO / "lux_ai" / "torchbeast" / "_baseline_monobeast_tmp.py"
 PRESET = REPO / "conf" / "league_sp.yaml"
 
 
@@ -32,6 +32,26 @@ def _git_baseline_source():
         ["git", "show", "HEAD:lux_ai/torchbeast/monobeast.py"],
         cwd=str(REPO), stderr=subprocess.DEVNULL,
     )
+
+
+def _load_baseline_learn():
+    """Execute the committed learner in memory without creating/deleting a file."""
+    module_name = "lux_ai.torchbeast._baseline_monobeast_memory"
+    module = types.ModuleType(module_name)
+    module.__file__ = "<git:HEAD:lux_ai/torchbeast/monobeast.py>"
+    module.__package__ = "lux_ai.torchbeast"
+    previous_wandb = sys.modules.get("wandb")
+    # The comparison disables W&B. A stub avoids importing its old SSL stack
+    # after Torch has initialized CUDA DLLs on Windows.
+    sys.modules["wandb"] = types.ModuleType("wandb")
+    try:
+        exec(compile(_git_baseline_source(), module.__file__, "exec"), module.__dict__)
+    finally:
+        if previous_wandb is None:
+            sys.modules.pop("wandb", None)
+        else:
+            sys.modules["wandb"] = previous_wandb
+    return module.learn
 
 
 def _build_flags(with_league_key: bool):
@@ -128,29 +148,23 @@ def _run_learn(learn_fn, flags, batch, base_state):
 def test_disabled_league_matches_pre_league_learner():
     from lux_ai.nns import create_model
 
-    BASELINE_MODULE.write_bytes(_git_baseline_source())
-    try:
-        from lux_ai.torchbeast._baseline_monobeast_tmp import learn as baseline_learn
-        from lux_ai.torchbeast.monobeast import learn as league_learn
+    baseline_learn = _load_baseline_learn()
+    from lux_ai.torchbeast.monobeast import learn as league_learn
 
-        flags_baseline = _build_flags(with_league_key=False)
-        flags_disabled = _build_flags(with_league_key=True)
+    flags_baseline = _build_flags(with_league_key=False)
+    flags_disabled = _build_flags(with_league_key=True)
 
-        torch.manual_seed(1234)
-        base_state = copy.deepcopy(
-            create_model(flags_baseline, flags_baseline.learner_device).state_dict()
-        )
-        batch = _make_batch(flags_baseline)
+    torch.manual_seed(1234)
+    base_state = copy.deepcopy(
+        create_model(flags_baseline, flags_baseline.learner_device).state_dict()
+    )
+    batch = _make_batch(flags_baseline)
 
-        baseline_losses = _run_learn(baseline_learn, flags_baseline, batch, base_state)
-        league_losses = _run_learn(league_learn, flags_disabled, batch, base_state)
+    baseline_losses = _run_learn(baseline_learn, flags_baseline, batch, base_state)
+    league_losses = _run_learn(league_learn, flags_disabled, batch, base_state)
 
-        assert set(baseline_losses) == set(league_losses)
-        for key, expected in baseline_losses.items():
-            actual = league_losses[key]
-            assert actual == expected, f"{key}: {actual} != {expected}"
-            assert actual == actual, f"{key} is NaN; the comparison would be vacuous"
-    finally:
-        if BASELINE_MODULE.exists():
-            BASELINE_MODULE.unlink()
-        sys.modules.pop("lux_ai.torchbeast._baseline_monobeast_tmp", None)
+    assert set(baseline_losses) == set(league_losses)
+    for key, expected in baseline_losses.items():
+        actual = league_losses[key]
+        assert actual == expected, f"{key}: {actual} != {expected}"
+        assert actual == actual, f"{key} is NaN; the comparison would be vacuous"

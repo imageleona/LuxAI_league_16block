@@ -156,6 +156,22 @@ def test_poll_returns_none_when_nothing_finished(tmp_path, monkeypatch):
     assert sched.poll(step=1) is None
 
 
+def test_poll_preserves_exact_best_candidate_without_deleting_files(tmp_path, monkeypatch):
+    sched = _scheduler(
+        tmp_path, monkeypatch, lambda **kw: _record(mean_win_rate=0.61),
+        save_best=True,
+    )
+    sched.note_games(10)
+    sched.start(_dump, step=123)
+    sched.poll(step=123)
+
+    best_weights = sched.best_dir / "lux_ai" / "rl_agent" / "best_weights.pt"
+    metadata = json.loads((sched.best_dir / "best_metadata.json").read_text(encoding="utf-8"))
+    assert best_weights.read_bytes() == b"weights"
+    assert metadata["step"] == 123
+    assert metadata["mean_win_rate"] == pytest.approx(0.61)
+
+
 def test_wandb_payload_keys(tmp_path):
     stats = wandb_payload(_record(), current_step=1_300_000)["AnchorEval"]
     for key in ("win_rate_mean", "round", "games", "wall_seconds", "eval_step",

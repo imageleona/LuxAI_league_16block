@@ -22,7 +22,7 @@ from ..lux import annotate
 
 MODEL_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 RL_AGENT_CONFIG_PATH = Path(__file__).parent / "rl_agent_config.yaml"
-CHECKPOINT_PATH, = list(Path(__file__).parent.glob('*.pt'))
+CHECKPOINT_PATHS = list(Path(__file__).parent.glob('*.pt'))
 AGENT = None
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -33,11 +33,16 @@ def pos_to_loc(pos: Tuple[int, int], board_dims: Tuple[int, int] = MAX_BOARD_SIZ
 
 
 class RLAgent:
-    def __init__(self, obs, conf):
-        with open(MODEL_CONFIG_PATH, 'r') as f:
-            self.model_flags = flags_to_namespace(yaml.safe_load(f))
-        with open(RL_AGENT_CONFIG_PATH, 'r') as f:
-            self.agent_flags = SimpleNamespace(**yaml.safe_load(f))
+    def __init__(self, obs, conf, checkpoint_path=None, model_flags=None,
+                 agent_flags=None, model=None):
+        if model_flags is None:
+            with open(MODEL_CONFIG_PATH, 'r') as f:
+                model_flags = flags_to_namespace(yaml.safe_load(f))
+        self.model_flags = model_flags
+        if agent_flags is None:
+            with open(RL_AGENT_CONFIG_PATH, 'r') as f:
+                agent_flags = SimpleNamespace(**yaml.safe_load(f))
+        self.agent_flags = agent_flags
         if torch.cuda.is_available():
             if self.agent_flags.device == "player_id":
                 device_id = f"cuda:{min(obs.player, torch.cuda.device_count() - 1)}"
@@ -70,9 +75,17 @@ class RLAgent:
         }
 
         # Load the model
-        self.model = create_model(self.model_flags, self.device)
-        checkpoint_states = torch.load(CHECKPOINT_PATH, map_location=self.device)
-        self.model.load_state_dict(checkpoint_states["model_state_dict"])
+        self.model = model if model is not None else create_model(self.model_flags, self.device)
+        if model is None:
+            if checkpoint_path is None:
+                if len(CHECKPOINT_PATHS) != 1:
+                    raise ValueError(
+                        "Provide checkpoint_path when the agent directory does not "
+                        "contain exactly one .pt file"
+                    )
+                checkpoint_path = CHECKPOINT_PATHS[0]
+            checkpoint_states = torch.load(checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint_states["model_state_dict"])
         self.model.eval()
 
         # Load the data augmenters
@@ -150,7 +163,8 @@ class RLAgent:
         overage_time_msg = f"Remaining overage time: {obs['remainingOverageTime']:.2f}"
 
         actions.append(annotate.sidetext(value_msg))
-        DEBUG_MESSAGE(" - ".join([value_msg, timing_msg, overage_time_msg]))
+        if os.environ.get("LUX_AGENT_DEBUG_TIMINGS") == "1":
+            DEBUG_MESSAGE(" - ".join([value_msg, timing_msg, overage_time_msg]))
         return actions
 
     def preprocess(self, obs, conf) -> NoReturn:
