@@ -253,7 +253,10 @@ class BasicActorCriticNetwork(nn.Module):
         x, input_mask, available_actions_mask, subtask_embeddings = self.dict_input_layer(x)
         base_out, input_mask = self.base_model((x, input_mask))
         if subtask_embeddings is not None:
-            subtask_embeddings = torch.repeat_interleave(subtask_embeddings, 2, dim=0)
+            # See lux_ai/nns/in_blocks.py for why this avoids torch.repeat_interleave.
+            subtask_embeddings = subtask_embeddings.unsqueeze(1).expand(
+                -1, 2, *subtask_embeddings.shape[1:]
+            ).reshape(-1, *subtask_embeddings.shape[1:])
         policy_logits, actions = self.actor(
             self.actor_base(base_out),
             available_actions_mask=available_actions_mask,

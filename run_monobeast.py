@@ -111,7 +111,7 @@ def main(flags: DictConfig):
             name=flags.name,
         )
 
-    flags = flags_to_namespace(OmegaConf.to_container(flags))
+    flags = flags_to_namespace(OmegaConf.to_container(flags, resolve=True))
     mp.set_sharing_strategy(flags.sharing_strategy)
     train(flags)
 

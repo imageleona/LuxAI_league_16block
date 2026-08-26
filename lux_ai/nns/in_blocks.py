@@ -183,7 +183,12 @@ class ConvEmbeddingInputLayer(nn.Module):
         player axes swapped for the opposing players
         """
         x, input_mask = x
-        input_mask = torch.repeat_interleave(input_mask, 2, dim=0)
+        # torch.repeat_interleave(input_mask, 2, dim=0) raises "repeats can not
+        # be negative" on CUDA with this torch build (1.13.1+cu117) on H100 —
+        # reproduces regardless of dtype or process count, so it's the op
+        # itself. unsqueeze+expand+reshape gives the identical interleaved
+        # duplicate without going through that kernel.
+        input_mask = input_mask.unsqueeze(1).expand(-1, 2, *input_mask.shape[1:]).reshape(-1, *input_mask.shape[1:])
         continuous_outs = []
         embedding_outs = {}
         for key, op in self.keys_to_op.items():

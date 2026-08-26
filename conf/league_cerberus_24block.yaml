@@ -1,0 +1,125 @@
+# PFSP league fine-tune starting from Isaiah Pressman's "Cerberus 3.1" agent
+# (internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research), his
+# final Kaggle submission at 24 blocks x 128 wide, ~62M training steps.
+# Architecture values below are copied verbatim from that checkpoint's own
+# lux_ai/rl_agent/config.yaml (n_blocks, hidden_dim, use_index_select) - it
+# predates adaptive_embedding_dims, so that flag is left at its default
+# (False), giving every embedding the full width the checkpoint expects.
+# Confirmed against the actual state_dict on 2026-08-26: base_model has
+# indices 0-24 (24 residual blocks) and conv1.weight is [128, 128, 5, 5].
+defaults:
+- override hydra/job_logging: colorlog
+- override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: ./outputs/${now:%m-%d}/${now:%H-%M-%S}
+
+# ============================================================================
+# PFSP league run: fine-tunes Cerberus 3.1 (24x128) while sampling opponents
+# from the same anchor pool used by league_haruto_16block.yaml. Anchors load
+# via their own saved configs (see lux_ai/league/), so the mixed-architecture
+# pool is unaffected by this file's model params.
+# ============================================================================
+
+name: league_cerberus_24block
+## WANDB params
+project: Lux_AI_2021_league
+entity: null
+group: cerberus_24block
+
+## ENV params
+act_space: BasicActionSpace
+obs_space: FixedShapeContinuousObsV2
+obs_space_kwargs: {}
+reward_space: GameResultReward
+reward_space_kwargs: {}
+
+## TRAINING params
+total_steps: 500000
+num_actors: 2
+n_actor_envs: 16
+unroll_length: 16
+batch_size: 4
+discounting: 0.999
+seed: 42
+
+## MODEL params - must match the checkpoint's own config.yaml exactly
+model_arch: conv_model
+n_blocks: 24
+hidden_dim: 128
+embedding_dim: 32
+n_merge_layers: 1
+normalize: False
+sum_player_embeddings: False
+use_index_select: False
+rescale_value_input: True
+rescale_se_input: True
+kernel_size: 5
+# Left unset (defaults to False/None): Cerberus 3.1 predates this flag, so
+# every embedding is the full 32-wide table the checkpoint was trained with.
+# adaptive_embedding_dims: False
+# adaptive_embedding_max_values: null
+
+## OPTIMIZER params
+optimizer_class: Adam
+optimizer_kwargs:
+  lr: 1e-5
+  eps: 0.0003
+min_lr_mod: 1.0
+
+## LOSS params
+entropy_cost: 2e-6
+baseline_cost: 1.
+teacher_kl_cost: 0.0
+teacher_baseline_cost: 0.0
+lmb: 0.9
+reduction: sum
+
+# No distillation teacher - the starting policy IS the strong agent here.
+use_teacher: False
+teacher_load_dir: ${hydra:runtime.cwd}/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+teacher_checkpoint_file: 062179520_weights.pt
+
+## LEAGUE params (see lux_ai/league/) - same anchor pool as league_haruto_16block.yaml
+league:
+  enabled: true
+  pool_size: 10
+  anchors:
+  - ${hydra:runtime.cwd}/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research
+  - ${hydra:runtime.cwd}/internal_testing/hall_of_fame/10-10_11-18-12_28576448
+  - ${hydra:runtime.cwd}/internal_testing/internal_agents/10-02_11-29-02_20000192
+  - ${hydra:runtime.cwd}/internal_testing/internal_agents/10-08_17-35-45_20000192
+  initial_members: []
+  anchor_eval_enabled: True
+  anchor_eval_every_n_games: 500
+  anchor_eval_n_seeds: 3
+  anchor_eval_map_sizes: [12, 16, 24, 32]
+  anchor_eval_parallel_games: 8
+  anchor_eval_at_start: True
+  mirror_frac: 0.5
+  snapshot_interval_updates: 500
+  priority: pfsp        # pfsp | variance | uniform
+  alpha: 0.5
+  eps_uniform: 0.1
+  anchor_floor: 0.15
+  anchor_report_every_n_games: 100
+  winrate_lambda: 0.1
+  winrate_init: 0.5
+  max_loaded_opponents: 8
+  opponent_sample: true
+
+# MISCELLANEOUS params
+actor_device: cuda:0
+learner_device: cuda:0
+model_log_freq: 100
+sharing_strategy: file_system
+disable_wandb: False
+debug: False
+
+# Fine-tune from Cerberus 3.1 (never train from scratch). Points straight at
+# the existing internal_testing copy rather than duplicating the 90MB file.
+load_dir: ${hydra:runtime.cwd}/internal_testing/hall_of_fame/11-24_12-56-23_062179520_must_research/lux_ai/rl_agent
+checkpoint_file: 062179520_weights.pt
+weights_only: True
+n_value_warmup_batches: 0
